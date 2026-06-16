@@ -18,11 +18,333 @@
 
 #include "repack.h"
 
+// MyAI patch: persistent mmap'd cache for the CPU_REPACK buffer.
+#if defined(__linux__) || defined(__APPLE__)
+#define GGML_REPACK_CACHE_IMPL 1
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <cerrno>
+#include <cstdlib>
+#include <vector>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
 #endif
 
 #define UNUSED GGML_UNUSED
+
+#ifdef GGML_REPACK_CACHE_IMPL
+// Cache for repacked weights, enabled per-load via GGML_CPU_REPACK_CACHE=<file>.
+// Hit: the repack buffer is an mmap of the cache file (file-backed, evictable)
+// and set_tensor skips both the source fault-in and the reshuffle.
+// Miss: repack writes through into the mapping; the first graph compute on the
+// buffer fsyncs the file and marks it COMPLETE (crash leaves BUILDING → rebuild).
+// Each tensor carries a fingerprint of its source bytes, so a stale or foreign
+// cache self-heals by re-repacking only the tensors that do not match.
+namespace ggml::cpu::repack_cache {
+
+static constexpr uint32_t MAGIC       = 0x5a525043; // "ZRPC"
+static constexpr uint32_t VERSION     = 1;
+static constexpr uint32_t ST_BUILDING = 1;
+static constexpr uint32_t ST_COMPLETE = 2;
+// Page-multiple up to 64 KiB pages; holds the header plus per-tensor records.
+static constexpr size_t   DATA_OFFSET = 256 * 1024;
+
+struct record {
+    uint64_t offset;  // tensor offset inside the data region
+    uint64_t nbytes;
+    uint64_t fp;      // fingerprint of the tensor's source bytes
+};
+
+struct file_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t state;
+    uint32_t n_records;
+    uint64_t feature_mask;
+    uint64_t data_size;
+    uint64_t reserved[4];
+};
+
+static constexpr uint32_t MAX_RECORDS =
+    (uint32_t) ((DATA_OFFSET - sizeof(file_header)) / sizeof(record));
+
+struct cache_state {
+    std::mutex            mtx;
+    std::atomic<bool>     needs_finalize{false};
+    bool                  active   = false;
+    bool                  hit      = false;  // false while building/dirty
+    int                   fd       = -1;
+    uint8_t *             base     = nullptr; // mmap base (== header)
+    size_t                map_size = 0;
+    uint64_t              gen      = 0;       // guards the async finalize thread
+    uint32_t              cursor   = 0;       // record lookup hint (loads are in offset order)
+    ggml_backend_buffer_t buffer   = nullptr;
+};
+
+static cache_state & st() {
+    static cache_state s;
+    return s;
+}
+
+// The repack layout depends on these; a mask mismatch invalidates the cache.
+static uint64_t feature_mask() {
+    uint64_t m = 0;
+    if (ggml_cpu_has_neon())        m |= 1ull << 0;
+    if (ggml_cpu_has_dotprod())     m |= 1ull << 1;
+    if (ggml_cpu_has_matmul_int8()) m |= 1ull << 2;
+    if (ggml_cpu_has_sve())         m |= 1ull << 3;
+    if (ggml_cpu_has_avx2())        m |= 1ull << 4;
+    if (ggml_cpu_has_avx512())      m |= 1ull << 5;
+    if (ggml_cpu_has_riscv_v())     m |= 1ull << 6;
+    return m | ((uint64_t) (uint32_t) ggml_cpu_get_sve_cnt() << 32);
+}
+
+// FNV-1a over size + head/tail source bytes: cheap, touches at most 2 pages.
+static uint64_t fingerprint(const void * data, size_t nbytes) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 0xcbf29ce484222325ull;
+    auto mix = [&](const uint8_t * q, size_t n) {
+        for (size_t i = 0; i < n; i++) { h ^= q[i]; h *= 0x100000001b3ull; }
+    };
+    const uint64_t sz = nbytes;
+    mix((const uint8_t *) &sz, sizeof(sz));
+    const size_t probe = nbytes < 32 ? nbytes : 32;
+    mix(p, probe);
+    mix(p + nbytes - probe, probe);
+    return h;
+}
+
+static void close_locked(cache_state & s) {
+    if (s.base) { munmap(s.base, s.map_size); }
+    if (s.fd >= 0) { close(s.fd); }
+    s.active = false; s.hit = false; s.buffer = nullptr;
+    s.base = nullptr; s.map_size = 0; s.fd = -1; s.cursor = 0;
+    s.needs_finalize.store(false, std::memory_order_relaxed);
+    s.gen++;
+}
+
+// Back the repack buffer with the cache file; nullptr → caller falls back to malloc.
+static uint8_t * attach(const char * path, size_t data_size) {
+    cache_state & s = st();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (s.active) {
+        GGML_LOG_WARN("repack-cache: already active, ignoring %s\n", path);
+        return nullptr;
+    }
+    const size_t file_size = DATA_OFFSET + data_size;
+
+    const int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        GGML_LOG_WARN("repack-cache: open(%s) failed: %s\n", path, strerror(errno));
+        return nullptr;
+    }
+
+    struct stat sb {};
+    bool hit = false;
+    if (fstat(fd, &sb) == 0 && (uint64_t) sb.st_size == (uint64_t) file_size) {
+        file_header h {};
+        if (pread(fd, &h, sizeof(h), 0) == (ssize_t) sizeof(h) &&
+            h.magic == MAGIC && h.version == VERSION && h.state == ST_COMPLETE &&
+            h.feature_mask == feature_mask() && h.data_size == (uint64_t) data_size &&
+            h.n_records > 0 && h.n_records <= MAX_RECORDS) {
+            hit = true;
+        }
+    }
+
+    if (!hit) {
+        // posix_fallocate reserves every block: no SIGBUS later on a full disk.
+        // NB: posix_fallocate returns the error code, it does not set errno.
+        int reserve_err = ftruncate(fd, 0) != 0 ? errno : posix_fallocate(fd, 0, (off_t) file_size);
+        if (reserve_err == EOPNOTSUPP || reserve_err == EINVAL) {
+            // FUSE (Android external storage) rejects fallocate. Physically
+            // allocate by writing zeros instead — one-time cost, and a full
+            // disk still fails here cleanly instead of SIGBUSing mid-repack.
+            GGML_LOG_INFO("repack-cache: fallocate unsupported on %s, zero-filling\n", path);
+            static const std::vector<uint8_t> zeros(8 * 1024 * 1024, 0);
+            reserve_err = 0;
+            for (size_t done = 0; done < file_size; ) {
+                const size_t chunk = file_size - done < zeros.size() ? file_size - done : zeros.size();
+                const ssize_t wr = write(fd, zeros.data(), chunk);
+                if (wr <= 0) {
+                    reserve_err = errno != 0 ? errno : EIO;
+                    break;
+                }
+                done += (size_t) wr;
+            }
+        }
+        if (reserve_err != 0) {
+            GGML_LOG_WARN("repack-cache: cannot reserve %zu MiB for %s: %s\n",
+                          file_size / (1024 * 1024), path, strerror(reserve_err));
+            close(fd);
+            unlink(path);
+            return nullptr;
+        }
+    }
+
+    // Always RW so a stale hit can degrade to an in-place rebuild without mprotect.
+    void * base = mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        GGML_LOG_WARN("repack-cache: mmap(%s) failed: %s\n", path, strerror(errno));
+        close(fd);
+        return nullptr;
+    }
+
+    if (!hit) {
+        file_header * h = (file_header *) base;
+        *h = {};
+        h->magic        = MAGIC;
+        h->version      = VERSION;
+        h->state        = ST_BUILDING;
+        h->feature_mask = feature_mask();
+        h->data_size    = (uint64_t) data_size;
+    }
+
+    s.active   = true;
+    s.hit      = hit;
+    s.fd       = fd;
+    s.base     = (uint8_t *) base;
+    s.map_size = file_size;
+    s.cursor   = 0;
+    s.gen++;
+    s.needs_finalize.store(!hit, std::memory_order_release);
+    GGML_LOG_INFO("repack-cache: %s %s (%zu MiB)\n",
+                  hit ? "hit" : "building", path, data_size / (1024 * 1024));
+    return (uint8_t *) base + DATA_OFFSET;
+}
+
+static void register_buffer(ggml_backend_buffer_t buffer) {
+    cache_state & s = st();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (s.active && s.buffer == nullptr) {
+        s.buffer = buffer;
+    }
+}
+
+// Release the mapping if buffer wrapping failed after attach.
+static void detach_unused() {
+    cache_state & s = st();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (s.active && s.buffer == nullptr) {
+        close_locked(s);
+    }
+}
+
+static void buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    cache_state & s = st();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (s.active && s.buffer == buffer) {
+        close_locked(s);
+    }
+}
+
+// True → the mapped bytes are this tensor's verified repack: caller must skip.
+// False → caller repacks normally (build mode writes land in the mapping).
+static bool on_set_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
+                          const void * data, size_t size) {
+    cache_state & s = st();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (!s.active || s.buffer != buffer) {
+        return false;
+    }
+
+    file_header * h    = (file_header *) s.base;
+    record *      recs = (record *) (s.base + sizeof(file_header));
+    const uint64_t off = (uint64_t) ((const uint8_t *) tensor->data - (s.base + DATA_OFFSET));
+    GGML_ASSERT(off + size <= h->data_size);
+    const uint64_t fp = fingerprint(data, size);
+
+    uint32_t idx = UINT32_MAX;
+    if (h->n_records > 0) {
+        for (uint32_t k = 0; k < h->n_records; k++) {
+            const uint32_t i = (s.cursor + k) % h->n_records;
+            if (recs[i].offset == off) { idx = i; break; }
+        }
+    }
+
+    if (s.hit) {
+        if (idx != UINT32_MAX && recs[idx].nbytes == (uint64_t) size && recs[idx].fp == fp) {
+            s.cursor = (idx + 1) % h->n_records;
+            return true;
+        }
+        // Stale or foreign cache: rebuild in place, tensor by tensor.
+        s.hit    = false;
+        h->state = ST_BUILDING;
+        s.needs_finalize.store(true, std::memory_order_release);
+        GGML_LOG_WARN("repack-cache: fingerprint mismatch at offset %llu, rebuilding in place\n",
+                      (unsigned long long) off);
+    }
+
+    if (idx == UINT32_MAX) {
+        if (h->n_records >= MAX_RECORDS) {
+            // Cannot track this model: stay BUILDING forever (correct, never trusted).
+            s.needs_finalize.store(false, std::memory_order_relaxed);
+            return false;
+        }
+        idx = h->n_records++;
+    }
+    recs[idx].offset = off;
+    recs[idx].nbytes = (uint64_t) size;
+    recs[idx].fp     = fp;
+    s.cursor = (idx + 1) % h->n_records;
+    return false;
+}
+
+// Called from compute on the cached buffer: by then the model load has finished,
+// so the mapping content is complete and can be made durable.
+static void maybe_finalize_async(const struct ggml_tensor * op) {
+    cache_state & s = st();
+    // Relaxed: this is the per-op hot path; the mutex below orders everything.
+    if (!s.needs_finalize.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const struct ggml_tensor * src0 = op->src[0];
+    if (!src0 || !src0->buffer) {
+        return;
+    }
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lock(s.mtx);
+        if (!s.active || s.buffer != src0->buffer || s.hit) {
+            return;
+        }
+        if (!s.needs_finalize.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        gen = s.gen;
+    }
+    std::thread([gen] {
+        cache_state & s2 = st();
+        std::lock_guard<std::mutex> lock(s2.mtx);
+        if (!s2.active || s2.gen != gen || s2.hit) {
+            return;
+        }
+        // Durable order: data first, COMPLETE header only after.
+        if (fdatasync(s2.fd) != 0) {
+            GGML_LOG_WARN("repack-cache: fdatasync failed: %s\n", strerror(errno));
+            s2.needs_finalize.store(true, std::memory_order_release);
+            return;
+        }
+        file_header * h = (file_header *) s2.base;
+        h->state = ST_COMPLETE;
+        if (msync(s2.base, DATA_OFFSET, MS_SYNC) != 0) {
+            h->state = ST_BUILDING;
+            GGML_LOG_WARN("repack-cache: header msync failed: %s\n", strerror(errno));
+            s2.needs_finalize.store(true, std::memory_order_release);
+            return;
+        }
+        GGML_LOG_INFO("repack-cache: finalized (COMPLETE)\n");
+    }).detach();
+}
+
+} // namespace ggml::cpu::repack_cache
+#endif // GGML_REPACK_CACHE_IMPL
 
 static inline int nearest_int(float fval) {
     assert(fabsf(fval) <= 4194303.f);
@@ -4187,6 +4509,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     }
 
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
+#ifdef GGML_REPACK_CACHE_IMPL
+        // First compute on the cached buffer ⇒ load finished ⇒ safe to finalize.
+        ggml::cpu::repack_cache::maybe_finalize_async(op);
+#endif
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 forward_mul_mat(params, op);
@@ -4735,6 +5061,12 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
+#ifdef GGML_REPACK_CACHE_IMPL
+    if (ggml::cpu::repack_cache::on_set_tensor(buffer, tensor, data, size)) {
+        return; // verified cache hit — repacked bytes already in the mapping
+    }
+#endif
+
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
     auto OK            = tensor_traits->repack(tensor, data, size);
 
@@ -4748,7 +5080,34 @@ static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_bu
     GGML_UNUSED(buft);
 }
 
+#ifdef GGML_REPACK_CACHE_IMPL
+static void ggml_backend_cpu_repack_cache_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml::cpu::repack_cache::buffer_free_buffer(buffer);
+}
+#endif
+
 static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+#ifdef GGML_REPACK_CACHE_IMPL
+    const char * cache_path = getenv("GGML_CPU_REPACK_CACHE");
+    if (cache_path && cache_path[0] != '\0') {
+        uint8_t * data = ggml::cpu::repack_cache::attach(cache_path, size);
+        if (data) {
+            ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, size);
+            if (buffer) {
+                buffer->buft              = buft;
+                buffer->iface.free_buffer = ggml_backend_cpu_repack_cache_buffer_free_buffer;
+                buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
+                buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
+                buffer->iface.get_tensor  = nullptr;
+                buffer->iface.cpy_tensor  = nullptr;
+                ggml::cpu::repack_cache::register_buffer(buffer);
+                return buffer;
+            }
+            ggml::cpu::repack_cache::detach_unused();
+        }
+        // fall through: cache unavailable → plain allocation, identical to upstream
+    }
+#endif
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
 
     if (buffer == nullptr) {
