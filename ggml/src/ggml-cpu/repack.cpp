@@ -42,7 +42,11 @@
 #ifdef GGML_REPACK_CACHE_IMPL
 // Cache for repacked weights, enabled per-load via GGML_CPU_REPACK_CACHE=<file>.
 // Hit: the repack buffer is an mmap of the cache file (file-backed, evictable)
-// and set_tensor skips both the source fault-in and the reshuffle.
+// and set_tensor skips both the source fault-in and the reshuffle. With
+// GGML_CPU_REPACK_CACHE_COPY=1 a hit reads the data into anonymous memory
+// instead: on the Exynos 9820 the page-cache pages read ~20 % slower than
+// anonymous ones and decode lost ~30 %. A stale copy-mode hit repacks into the
+// copy and leaves the file BUILDING, so the next load rebuilds it.
 // Miss: repack writes through into the mapping; the first graph compute on the
 // buffer fsyncs the file and marks it COMPLETE (crash leaves BUILDING → rebuild).
 // Each tensor carries a fingerprint of its source bytes, so a stale or foreign
@@ -83,6 +87,9 @@ struct cache_state {
     int                   fd       = -1;
     uint8_t *             base     = nullptr; // mmap base (== header)
     size_t                map_size = 0;
+    uint8_t *             data     = nullptr; // what the buffer holds: base + DATA_OFFSET, or copy
+    uint8_t *             copy     = nullptr; // anonymous copy of a hit (copy mode)
+    size_t                copy_size = 0;
     uint64_t              gen      = 0;       // guards the async finalize thread
     uint32_t              cursor   = 0;       // record lookup hint (loads are in offset order)
     ggml_backend_buffer_t buffer   = nullptr;
@@ -123,9 +130,11 @@ static uint64_t fingerprint(const void * data, size_t nbytes) {
 
 static void close_locked(cache_state & s) {
     if (s.base) { munmap(s.base, s.map_size); }
+    if (s.copy) { munmap(s.copy, s.copy_size); }
     if (s.fd >= 0) { close(s.fd); }
     s.active = false; s.hit = false; s.buffer = nullptr;
     s.base = nullptr; s.map_size = 0; s.fd = -1; s.cursor = 0;
+    s.data = nullptr; s.copy = nullptr; s.copy_size = 0;
     s.needs_finalize.store(false, std::memory_order_relaxed);
     s.gen++;
 }
@@ -211,12 +220,47 @@ static uint8_t * attach(const char * path, size_t data_size) {
     s.fd       = fd;
     s.base     = (uint8_t *) base;
     s.map_size = file_size;
+    s.data     = s.base + DATA_OFFSET;
     s.cursor   = 0;
     s.gen++;
     s.needs_finalize.store(!hit, std::memory_order_release);
+
+    const char * copy_env = getenv("GGML_CPU_REPACK_CACHE_COPY");
+    if (hit && copy_env && strcmp(copy_env, "1") == 0) {
+        const int64_t t0 = ggml_time_us();
+        void * mem = mmap(nullptr, data_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        bool ok = mem != MAP_FAILED;
+        if (ok) {
+#ifdef POSIX_FADV_SEQUENTIAL
+            posix_fadvise(fd, (off_t) DATA_OFFSET, (off_t) data_size, POSIX_FADV_SEQUENTIAL);
+#endif
+            for (size_t done = 0; done < data_size; ) {
+                const size_t  chunk = data_size - done < (64u << 20) ? data_size - done : (64u << 20);
+                const ssize_t rd    = pread(fd, (uint8_t *) mem + done, chunk, (off_t) (DATA_OFFSET + done));
+                if (rd <= 0) {
+                    GGML_LOG_WARN("repack-cache: copy read failed: %s\n", rd < 0 ? strerror(errno) : "short file");
+                    ok = false;
+                    break;
+                }
+                done += (size_t) rd;
+            }
+            if (!ok) {
+                munmap(mem, data_size);
+            }
+        }
+        if (ok) {
+            s.copy      = (uint8_t *) mem;
+            s.copy_size = data_size;
+            s.data      = s.copy;
+            GGML_LOG_INFO("repack-cache: hit %s (%zu MiB), copied to anonymous memory in %lld ms\n",
+                          path, data_size / (1024 * 1024), (long long) ((ggml_time_us() - t0) / 1000));
+            return s.data;
+        }
+        // Falls back to the mapping: slower decode, still correct.
+    }
     GGML_LOG_INFO("repack-cache: %s %s (%zu MiB)\n",
                   hit ? "hit" : "building", path, data_size / (1024 * 1024));
-    return (uint8_t *) base + DATA_OFFSET;
+    return s.data;
 }
 
 static void register_buffer(ggml_backend_buffer_t buffer) {
@@ -253,10 +297,14 @@ static bool on_set_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor
     if (!s.active || s.buffer != buffer) {
         return false;
     }
+    // A stale copy: every tensor repacks into the copy and the file is left alone.
+    if (s.copy && !s.hit) {
+        return false;
+    }
 
     file_header * h    = (file_header *) s.base;
     record *      recs = (record *) (s.base + sizeof(file_header));
-    const uint64_t off = (uint64_t) ((const uint8_t *) tensor->data - (s.base + DATA_OFFSET));
+    const uint64_t off = (uint64_t) ((const uint8_t *) tensor->data - s.data);
     GGML_ASSERT(off + size <= h->data_size);
     const uint64_t fp = fingerprint(data, size);
 
@@ -276,6 +324,13 @@ static bool on_set_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor
         // Stale or foreign cache: rebuild in place, tensor by tensor.
         s.hit    = false;
         h->state = ST_BUILDING;
+        if (s.copy) {
+            // The repack lands in the copy, not the file: never finalize it here.
+            s.needs_finalize.store(false, std::memory_order_relaxed);
+            GGML_LOG_WARN("repack-cache: fingerprint mismatch at offset %llu, repacking into the copy; "
+                          "the file rebuilds on the next load\n", (unsigned long long) off);
+            return false;
+        }
         s.needs_finalize.store(true, std::memory_order_release);
         GGML_LOG_WARN("repack-cache: fingerprint mismatch at offset %llu, rebuilding in place\n",
                       (unsigned long long) off);
