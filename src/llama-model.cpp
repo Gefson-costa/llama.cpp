@@ -23,6 +23,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1418,7 +1419,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // MyAI patch: LLAMA_MMAP_NO_PREFETCH=1 maps without MAP_POPULATE / WILLNEED. A load whose
+    // repacked weights come from a complete repack cache reads few of the GGUF's pages, and the
+    // prefetch would read the whole file synchronously.
+    const char * no_prefetch = getenv("LLAMA_MMAP_NO_PREFETCH");
+    const bool   prefetch    = !(no_prefetch && strcmp(no_prefetch, "1") == 0);
+    ml.init_mappings(prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers

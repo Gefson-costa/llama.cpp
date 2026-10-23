@@ -18,9 +18,10 @@
 
 #include "repack.h"
 
-// MyAI patch: persistent mmap'd cache for the CPU_REPACK buffer.
+// MyAI patch: persistent mmap'd cache for the CPU_REPACK and CPU_KLEIDIAI buffers.
 #if defined(__linux__) || defined(__APPLE__)
 #define GGML_REPACK_CACHE_IMPL 1
+#include "repack-cache.h"
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -95,9 +96,11 @@ struct cache_state {
     ggml_backend_buffer_t buffer   = nullptr;
 };
 
-static cache_state & st() {
-    static cache_state s;
-    return s;
+// One state per buffer type (repack_cache::SLOT_*), so a load with both CPU_REPACK and
+// CPU_KLEIDIAI weights caches both, each in its own file.
+static cache_state & st(int slot) {
+    static cache_state s[N_SLOTS];
+    return s[slot];
 }
 
 // The repack layout depends on these; a mask mismatch invalidates the cache.
@@ -140,8 +143,9 @@ static void close_locked(cache_state & s) {
 }
 
 // Back the repack buffer with the cache file; nullptr → caller falls back to malloc.
-static uint8_t * attach(const char * path, size_t data_size) {
-    cache_state & s = st();
+// The header stores feature_mask() ^ salt: CPU_REPACK passes 0, so its existing files stay valid.
+uint8_t * attach(int slot, const char * path, size_t data_size, uint64_t salt) {
+    cache_state & s = st(slot);
     std::lock_guard<std::mutex> lock(s.mtx);
     if (s.active) {
         GGML_LOG_WARN("repack-cache: already active, ignoring %s\n", path);
@@ -161,7 +165,7 @@ static uint8_t * attach(const char * path, size_t data_size) {
         file_header h {};
         if (pread(fd, &h, sizeof(h), 0) == (ssize_t) sizeof(h) &&
             h.magic == MAGIC && h.version == VERSION && h.state == ST_COMPLETE &&
-            h.feature_mask == feature_mask() && h.data_size == (uint64_t) data_size &&
+            h.feature_mask == (feature_mask() ^ salt) && h.data_size == (uint64_t) data_size &&
             h.n_records > 0 && h.n_records <= MAX_RECORDS) {
             hit = true;
         }
@@ -211,7 +215,7 @@ static uint8_t * attach(const char * path, size_t data_size) {
         h->magic        = MAGIC;
         h->version      = VERSION;
         h->state        = ST_BUILDING;
-        h->feature_mask = feature_mask();
+        h->feature_mask = feature_mask() ^ salt;
         h->data_size    = (uint64_t) data_size;
     }
 
@@ -263,8 +267,8 @@ static uint8_t * attach(const char * path, size_t data_size) {
     return s.data;
 }
 
-static void register_buffer(ggml_backend_buffer_t buffer) {
-    cache_state & s = st();
+void register_buffer(int slot, ggml_backend_buffer_t buffer) {
+    cache_state & s = st(slot);
     std::lock_guard<std::mutex> lock(s.mtx);
     if (s.active && s.buffer == nullptr) {
         s.buffer = buffer;
@@ -272,31 +276,28 @@ static void register_buffer(ggml_backend_buffer_t buffer) {
 }
 
 // Release the mapping if buffer wrapping failed after attach.
-static void detach_unused() {
-    cache_state & s = st();
+void detach_unused(int slot) {
+    cache_state & s = st(slot);
     std::lock_guard<std::mutex> lock(s.mtx);
     if (s.active && s.buffer == nullptr) {
         close_locked(s);
     }
 }
 
-static void buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    cache_state & s = st();
-    std::lock_guard<std::mutex> lock(s.mtx);
-    if (s.active && s.buffer == buffer) {
-        close_locked(s);
+void buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    for (int slot = 0; slot < N_SLOTS; slot++) {
+        cache_state & s = st(slot);
+        std::lock_guard<std::mutex> lock(s.mtx);
+        if (s.active && s.buffer == buffer) {
+            close_locked(s);
+        }
     }
 }
 
 // True → the mapped bytes are this tensor's verified repack: caller must skip.
 // False → caller repacks normally (build mode writes land in the mapping).
-static bool on_set_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
-                          const void * data, size_t size) {
-    cache_state & s = st();
-    std::lock_guard<std::mutex> lock(s.mtx);
-    if (!s.active || s.buffer != buffer) {
-        return false;
-    }
+static bool on_set_tensor_locked(cache_state & s, const struct ggml_tensor * tensor,
+                                 const void * data, size_t size) {
     // A stale copy: every tensor repacks into the copy and the file is left alone.
     if (s.copy && !s.hit) {
         return false;
@@ -351,10 +352,22 @@ static bool on_set_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor
     return false;
 }
 
+bool on_set_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
+                   const void * data, size_t size) {
+    for (int slot = 0; slot < N_SLOTS; slot++) {
+        cache_state & s = st(slot);
+        std::lock_guard<std::mutex> lock(s.mtx);
+        if (s.active && s.buffer == buffer) {
+            return on_set_tensor_locked(s, tensor, data, size);
+        }
+    }
+    return false;
+}
+
 // Called from compute on the cached buffer: by then the model load has finished,
 // so the mapping content is complete and can be made durable.
-static void maybe_finalize_async(const struct ggml_tensor * op) {
-    cache_state & s = st();
+static void maybe_finalize_slot(int slot, const struct ggml_tensor * op) {
+    cache_state & s = st(slot);
     // Relaxed: this is the per-op hot path; the mutex below orders everything.
     if (!s.needs_finalize.load(std::memory_order_relaxed)) {
         return;
@@ -374,8 +387,8 @@ static void maybe_finalize_async(const struct ggml_tensor * op) {
         }
         gen = s.gen;
     }
-    std::thread([gen] {
-        cache_state & s2 = st();
+    std::thread([slot, gen] {
+        cache_state & s2 = st(slot);
         std::lock_guard<std::mutex> lock(s2.mtx);
         if (!s2.active || s2.gen != gen || s2.hit) {
             return;
@@ -396,6 +409,12 @@ static void maybe_finalize_async(const struct ggml_tensor * op) {
         }
         GGML_LOG_INFO("repack-cache: finalized (COMPLETE)\n");
     }).detach();
+}
+
+void maybe_finalize_async(const struct ggml_tensor * op) {
+    for (int slot = 0; slot < N_SLOTS; slot++) {
+        maybe_finalize_slot(slot, op);
+    }
 }
 
 } // namespace ggml::cpu::repack_cache
@@ -5145,7 +5164,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
 #ifdef GGML_REPACK_CACHE_IMPL
     const char * cache_path = getenv("GGML_CPU_REPACK_CACHE");
     if (cache_path && cache_path[0] != '\0') {
-        uint8_t * data = ggml::cpu::repack_cache::attach(cache_path, size);
+        uint8_t * data = ggml::cpu::repack_cache::attach(ggml::cpu::repack_cache::SLOT_REPACK, cache_path, size, 0);
         if (data) {
             ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, size);
             if (buffer) {
@@ -5155,10 +5174,10 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
                 buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
                 buffer->iface.get_tensor  = nullptr;
                 buffer->iface.cpy_tensor  = nullptr;
-                ggml::cpu::repack_cache::register_buffer(buffer);
+                ggml::cpu::repack_cache::register_buffer(ggml::cpu::repack_cache::SLOT_REPACK, buffer);
                 return buffer;
             }
-            ggml::cpu::repack_cache::detach_unused();
+            ggml::cpu::repack_cache::detach_unused(ggml::cpu::repack_cache::SLOT_REPACK);
         }
         // fall through: cache unavailable → plain allocation, identical to upstream
     }

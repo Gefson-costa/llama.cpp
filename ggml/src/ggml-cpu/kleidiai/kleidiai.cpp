@@ -42,6 +42,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-threading.h"
 #include "traits.h"
+#include "repack-cache.h"
 
 #include "kernels.h"
 
@@ -537,6 +538,10 @@ class tensor_traits : public ggml::cpu::tensor_traits {
     }
 
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * dst) override {
+#ifdef GGML_REPACK_CACHE_AVAILABLE
+        // First compute on the cached buffer ⇒ load finished ⇒ safe to finalize.
+        ggml::cpu::repack_cache::maybe_finalize_async(dst);
+#endif
         if (dst->op == GGML_OP_MUL_MAT) {
             if (dst->src[0]->type == GGML_TYPE_Q4_0 || dst->src[0]->type == GGML_TYPE_Q8_0) {
                 return compute_forward_qx(params, dst);
@@ -1350,10 +1355,32 @@ static enum ggml_status ggml_backend_cpu_kleidiai_buffer_init_tensor(ggml_backen
     GGML_UNUSED(buffer);
 }
 
+#ifdef GGML_REPACK_CACHE_AVAILABLE
+// The packed layout follows the kernel chain (CPU features, SME) and the fallback rule, so a cache
+// built under other values must miss.
+static uint64_t kleidiai_cache_salt() {
+    uint64_t salt = (uint64_t) GGML_KLEIDIAI_PACK_MAGIC << 32;
+    salt ^= (uint64_t) ctx.features;
+    salt ^= (uint64_t) GGML_KLEIDIAI_PACK_VERSION << 16;
+    salt ^= (uint64_t) (kleidiai_pack_fallback_allowed() ? 1 : 0) << 24;
+    return salt;
+}
+
+static void ggml_backend_cpu_kleidiai_cache_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml::cpu::repack_cache::buffer_free_buffer(buffer);
+}
+#endif
+
 static void ggml_backend_cpu_kleidiai_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                        const void * data, size_t offset, size_t size) {
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
+
+#ifdef GGML_REPACK_CACHE_AVAILABLE
+    if (ggml::cpu::repack_cache::on_set_tensor(buffer, tensor, data, size)) {
+        return; // verified cache hit — packed bytes already in the buffer
+    }
+#endif
 
     auto tensor_traits = (ggml::cpu::kleidiai::tensor_traits *) tensor->extra;
     auto OK            = tensor_traits->repack(tensor, data, size);
@@ -1368,6 +1395,30 @@ static const char * ggml_backend_cpu_kleidiai_buffer_type_get_name(ggml_backend_
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_kleidiai_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+#ifdef GGML_REPACK_CACHE_AVAILABLE
+    const char * cache_env = getenv("GGML_CPU_REPACK_CACHE");
+    if (cache_env && cache_env[0] != '\0') {
+        // Beside CPU_REPACK's file: a load with weights in both buffers caches both.
+        const std::string cache_path = std::string(cache_env) + ".kai";
+        uint8_t * data = ggml::cpu::repack_cache::attach(ggml::cpu::repack_cache::SLOT_KLEIDIAI,
+                                                         cache_path.c_str(), size, kleidiai_cache_salt());
+        if (data) {
+            ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, size);
+            if (buffer) {
+                buffer->buft              = buft;
+                buffer->iface.free_buffer = ggml_backend_cpu_kleidiai_cache_buffer_free_buffer;
+                buffer->iface.init_tensor = ggml_backend_cpu_kleidiai_buffer_init_tensor;
+                buffer->iface.set_tensor  = ggml_backend_cpu_kleidiai_buffer_set_tensor;
+                buffer->iface.get_tensor  = nullptr;
+                buffer->iface.cpy_tensor  = nullptr;
+                ggml::cpu::repack_cache::register_buffer(ggml::cpu::repack_cache::SLOT_KLEIDIAI, buffer);
+                return buffer;
+            }
+            ggml::cpu::repack_cache::detach_unused(ggml::cpu::repack_cache::SLOT_KLEIDIAI);
+        }
+        // fall through: cache unavailable → plain allocation, identical to upstream
+    }
+#endif
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
 
     if (buffer == nullptr) {
